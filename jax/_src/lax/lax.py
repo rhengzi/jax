@@ -136,7 +136,6 @@ def nextafter(x1: Array, x2: Array) -> Array:
   Note that in some environments flush-denormal-to-zero semantics is used.
   This means that, around zero, this function returns strictly non-zero
   values which appear as zero in any operations. Consider this example::
-
     >>> jnp.nextafter(0, 1)  # denormal numbers are representable
     DeviceArray(1.e-45, dtype=float32)
     >>> jnp.nextafter(0, 1) * 1  # but are flushed to zero
@@ -1148,15 +1147,7 @@ def reduce(operands: Array, init_values: Array, computation: Callable,
 @cache()
 def _reduction_jaxpr(computation, aval):
   pval = pe.PartialVal.unknown(aval)
-  @lu.wrap_init
-  def comp(x, y):
-    result = computation(x, y)
-    if not (isinstance(result, core.Tracer) or core.valid_jaxtype(result)):
-      raise ValueError(
-          f"Invalid return type from reduction function: {type(result)}\n"
-          f"Reduction functions should only return an array.\n"
-          f"Full return value: {result}")
-    return (result,)
+  comp = lu.wrap_init(lambda x, y: (computation(x, y),))
   jaxpr, _, consts = pe.trace_to_jaxpr(comp, (pval, pval), instantiate=False)
   return jaxpr, consts
 
@@ -1979,16 +1970,19 @@ _fixed_dtype = lambda dtype: lambda *args, **kwargs: dtypes.canonicalize_dtype(d
 _complex_basetype = lambda dtype: np.abs(np.zeros((), dtype)).dtype
 
 def standard_primitive(shape_rule, dtype_rule, name, translation_rule=None,
-                       multiple_results=False):
+                       multiple_results=False, named_shape_rule=None):
   prim = Primitive(name)
   prim.multiple_results = multiple_results
   prim.def_impl(partial(xla.apply_primitive, prim))
-  prim.def_abstract_eval(partial(standard_abstract_eval, prim, shape_rule, dtype_rule))
+  named_shape_rule = named_shape_rule or partial(fallback_named_shape_rule, prim)
+  prim.def_abstract_eval(partial(
+      standard_abstract_eval, prim, shape_rule, dtype_rule, named_shape_rule))
   xla.translations[prim] = translation_rule or partial(standard_translate, name)
   return prim
 
 
-def standard_abstract_eval(prim, shape_rule, dtype_rule, *args, **kwargs):
+def standard_abstract_eval(prim, shape_rule, dtype_rule, named_shape_rule,
+                           *args, **kwargs):
   assert all(isinstance(arg, UnshapedArray) for arg in args), args
   least_specialized = _max(
       map(type, args), key=operator.attrgetter('array_abstraction_level'))
@@ -2001,7 +1995,10 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, *args, **kwargs):
     shapes, dtypes = shape_rule(*args, **kwargs), dtype_rule(*args, **kwargs)
     if not prim.multiple_results:
       shapes, dtypes = [shapes], [dtypes]
-    out_avals = safe_map(ShapedArray, shapes, dtypes)
+    named_shapes = named_shape_rule(*args, **kwargs) or [{} for _ in shapes]
+    out_avals = [
+        ShapedArray(shape, dtype, False, named_shape) for
+        shape, dtype, named_shape in safe_zip(shapes, dtypes, named_shapes)]
   elif least_specialized is UnshapedArray:
     dtypes = dtype_rule(*args, **kwargs)
     if not prim.multiple_results:
@@ -2017,6 +2014,50 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, *args, **kwargs):
 def standard_translate(name, c, *args, **kwargs):
   xla_opname = ''.join(term.capitalize() for term in name.split('_'))
   return getattr(xops, xla_opname)(*args, **kwargs)
+
+
+@lu.transformation_with_aux
+def get_dims_out(dims_in, *args, **kwargs):
+  vals_out, dims_out = yield (args, dims_in), kwargs
+  yield vals_out, dims_out
+
+def fallback_named_shape_rule(prim, *avals, **params):
+  all_names = set([name for aval in avals for name in aval.named_shape] +
+                   (list(params['axis_name']) if 'axis_name' in params else []))
+  out_named_shape = None
+  # note: this relies on independence of batching over different axes
+  # (= commutativity of batching rules). That isn't true for at least
+  # `while_loop`.
+  for name in all_names:
+    frame = core.axis_frame(name)
+    vmap_avals = [
+        aval.update(shape=(frame.size, *aval.shape),
+                    weak_type=False).strip_named_shape()
+        if name in aval.named_shape else aval for aval in avals]
+    vmap_dims = [0 if name in aval.named_shape else batching.not_mapped
+                 for aval in avals]
+    if prim in batching.collective_rules:
+      rule = partial(batching.collective_rules[prim], frame)
+    elif prim in batching.initial_style_batchers:
+      rule = partial(batching.initial_style_batchers[prim], axis_name=name)
+    elif prim in batching.primitive_batchers:
+      rule = batching.primitive_batchers[prim]
+    else:
+      raise NotImplementedError(f"primitive {prim} cannot be used with named "
+                                f"axes because it has no batching rule")
+    f = lu.wrap_init(rule, params)
+    f, vmap_dims_out = get_dims_out(f, vmap_dims)
+    pe.trace_to_jaxpr_dynamic(f, vmap_avals)
+    dims_out = vmap_dims_out()
+    if not prim.multiple_results: dims_out = [dims_out]
+    mapped_out = [d is not batching.not_mapped for d in dims_out]
+    if out_named_shape is None:
+      out_named_shape = [{} for m in mapped_out]
+    out_named_shape = [{name: frame.size, **ns} if m else ns
+                       for ns, m in safe_zip(out_named_shape, mapped_out)]
+  if out_named_shape is not None and len(out_named_shape) == 0:
+    import pdb; pdb.set_trace()
+  return out_named_shape
 
 
 def unop_dtype_rule(result_dtype, accepted_dtypes, name, aval, **kwargs):

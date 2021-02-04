@@ -2367,5 +2367,28 @@ class LazyConstantTest(jtu.JaxTestCase):
                                 "index_dtype must be an integer type"):
       jax_fn(np.ones((2, 2)), axis=0, index_dtype=index_dtype)
 
+class LaxNamedShapeTest(jtu.JaxTestCase):
+
+  def test_abstract_eval(self):
+    with core.extend_axis_env('i', 10, None):
+      aval1 = core.ShapedArray((2, 3), np.float32, False, {'i': 10})
+      out = lax.sin_p.abstract_eval(aval1)
+      self.assertEqual(out, aval1)
+
+    with core.extend_axis_env('i', 10, None):
+      with core.extend_axis_env('j', 5, None):
+        aval1 = core.ShapedArray((2, 3), np.float32, False, {'i': 10})
+        aval2 = core.ShapedArray((2, 3), np.float32, False, {'j': 5})
+        expected = core.ShapedArray((2, 3), np.float32, False, {'i': 10, 'j': 5})
+        out = lax.add_p.abstract_eval(aval1, aval2)
+        self.assertEqual(out, expected)
+
+  def test_abstract_eval_collective(self):
+    with core.extend_axis_env('i', 10, None):
+      aval1 = core.ShapedArray((2, 3), np.float32, False, {'i': 10, 'j': 5})
+      expected = core.ShapedArray((2, 3), np.float32, False, {'j': 5})
+      out = lax.psum_p.abstract_eval(aval1, axis_name='i')
+      self.assertEqual(out, expected)
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
